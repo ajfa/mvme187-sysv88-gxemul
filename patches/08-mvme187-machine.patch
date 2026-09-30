@@ -1,0 +1,48 @@
+--- a/src/machines/machine_mvme88k.c
++++ b/src/machines/machine_mvme88k.c
+@@ -102,8 +102,11 @@
+ 		machine->main_console_handle =
+ 		    (size_t) device_add(machine, tmpstr);
+ 
+-		/*  ie0 ethernet: TODO  */
+-		device_add(machine, "unreadable addr=0xfff46000 len=0x1000");
++		/*  ie0: Intel 82596CA ethernet at 0xfff46000:  */
++		snprintf(tmpstr, sizeof(tmpstr), "i596 irq=%s.cpu[%i].pcc2.%i "
++		    "addr=0xfff46000", machine->path, machine->bootstrap_cpu,
++		    PCC2V_IE);
++		device_add(machine, tmpstr);
+ 
+ 		/*  53C710 SCSI at 0xfff47000:  */
+ 		snprintf(tmpstr, sizeof(tmpstr), "osiop irq=%s.cpu[%i].pcc2.%i "
+@@ -122,6 +125,16 @@
+ 		/*  VME devices: TODO  */
+ 		device_add(machine, "unreadable addr=0xffff0000 len=0x10000");
+ 
++		/*  Boot EPROM (187Bug), loaded with raw:0xff800000:...  */
++		if (!machine->prom_emulation) {
++			dev_ram_init(machine, 0xff800000, 0x400000,
++			    DEV_RAM_RAM, 0, "eprom");
++
++			/*  128 KB battery-backed SRAM:  */
++			dev_ram_init(machine, 0xffe00000, 0x20000,
++			    DEV_RAM_RAM, 0, "sram");
++		}
++
+ 		break;
+ 
+ 	case MACHINE_MVME88K_188:
+@@ -166,8 +179,12 @@
+ 	case MACHINE_MVME88K_197:  cpu->cd.m88k.r[8] = 0x197; break;
+ 	}
+ 
+-	/*  TODO: r3 and r7 must be set correctly to let
+-	    OpenBSD/mvme88k detect correct boot device.  */
++	/*  Boot from the on-board SCSI controller (NCR53C710 at
++	    0xfff47000 on MVME187), target 0, lun 0.  */
++	if (machine->machine_subtype == MACHINE_MVME88K_187) {
++		cpu->cd.m88k.r[3] = 0xfff47000;
++		cpu->cd.m88k.r[7] = 0;
++	}
+ }
+ 
+ 

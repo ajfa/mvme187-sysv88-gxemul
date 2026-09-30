@@ -1,0 +1,99 @@
+--- a/src/cpus/memory_rw.c
++++ b/src/cpus/memory_rw.c
+@@ -427,6 +427,16 @@
+ 		} else
+ #endif /* MIPS */
+ 		{
++#ifdef MEM_M88K
++			/*  No RAM here: bus error, as on the real board
++			    (SVR4/m88k sizes memory this way).  */
++			if (!no_exceptions) {
++				m88k_exception(cpu, cache == CACHE_INSTRUCTION
++				    ? M88K_EXCEPTION_INSTRUCTION_ACCESS
++				    : M88K_EXCEPTION_DATA_ACCESS, 0);
++				return MEMORY_ACCESS_FAILED;
++			}
++#endif
+ 			if (paddr >= mem->physical_max && !no_exceptions)
+ 				if (memory_warn_about_unimplemented_addr
+ 				    (cpu, mem, writeflag, paddr, len))
+@@ -489,6 +499,79 @@
+ 
+ 	offset = paddr & offset_mask;
+ 
++#ifdef MEM_M88K
++	{
++		/*  GXEMUL_SPLWATCH=r1:va1,va2,...: log reads and writes of
++		    some kernel words; dump the log when one of them is
++		    written with r1 equal to the trigger.  */
++#define	SPLW_N	256
++		static int watch_init = 0, watch_n = 0;
++		static uint32_t watch_va[8], watch_r1;
++		static struct { uint32_t va, r1, r31, val; int w; } ring[SPLW_N];
++		static int ring_pos = 0;
++		int wi;
++		if (!watch_init) {
++			char *e = getenv("GXEMUL_SPLWATCH");
++			watch_init = 1;
++			if (e != NULL) {
++				char *c;
++				watch_r1 = strtoul(e, &c, 0);
++				while (*c == ':' || *c == ',') {
++					if (watch_n < 8)
++						watch_va[watch_n++] =
++						    strtoul(c + 1, &c, 0);
++				}
++			}
++		}
++		for (wi = 0; wi < watch_n; wi++) {
++			uint32_t v = 0;
++			int i;
++			if (((vaddr ^ watch_va[wi]) & ~offset_mask) != 0)
++				continue;
++			dyntrans_device_danger = 1;
++			if ((uint32_t)vaddr != watch_va[wi])
++				continue;
++			if (writeflag == MEM_WRITE)
++				for (i = 0; i < (int)len; i++)
++					v = (v << 8) | data[i];
++			else
++				for (i = 0; i < (int)len; i++)
++					v = (v << 8) | memory_paddr_to_hostaddr(
++					    mem, paddr & ~offset_mask, 0)
++					    [(paddr & offset_mask) + i];
++			for (i = 1; i <= 8; i++) {
++				int k = (ring_pos - i + SPLW_N) % SPLW_N;
++				if (ring[k].va == (uint32_t)vaddr &&
++				    ring[k].r1 == cpu->cd.m88k.r[1] &&
++				    ring[k].val == v && ring[k].w ==
++				    (writeflag == MEM_WRITE))
++					break;
++			}
++			if (i <= 8 && writeflag != MEM_WRITE)
++				continue;
++			ring[ring_pos].va = vaddr;
++			ring[ring_pos].r1 = cpu->cd.m88k.r[1];
++			ring[ring_pos].r31 = cpu->cd.m88k.r[31];
++			ring[ring_pos].val = v;
++			ring[ring_pos].w = writeflag == MEM_WRITE;
++			ring_pos = (ring_pos + 1) % SPLW_N;
++			if (writeflag == MEM_WRITE && watch_r1 != 0 &&
++			    cpu->cd.m88k.r[1] == watch_r1) {
++				fprintf(stderr, "[ SPLWATCH dump ]\n");
++				for (i = 0; i < SPLW_N; i++) {
++					int k = (ring_pos + i) % SPLW_N;
++					if (ring[k].va == 0)
++						continue;
++					fprintf(stderr, "[ SPLWATCH %s %08x r1=%08x"
++					    " r31=%08x val=%x ]\n", ring[k].w?
++					    "W" : "r", ring[k].va, ring[k].r1,
++					    ring[k].r31, ring[k].val);
++				}
++			}
++		}
++	}
++#endif
++
+ 	if (cpu->update_translation_table != NULL && !dyntrans_device_danger
+ #ifdef MEM_MIPS
+ 	    /*  Ugly hack for R2000/R3000 caches:  */

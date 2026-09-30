@@ -1,0 +1,836 @@
+--- a/src/devices/dev_i82596.c
++++ b/src/devices/dev_i82596.c
+@@ -0,0 +1,673 @@
++/*
++ *  Copyright (C) 2026  ajfa
++ *
++ *  Redistribution and use in source and binary forms, with or without
++ *  modification, are permitted provided that the following conditions are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *  3. The name of the author may not be used to endorse or promote products
++ *     derived from this software without specific prior written permission.
++ *
++ *  THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ *  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ *  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ *  ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ *  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ *  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ *  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ *  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ *  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ *  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ *  SUCH DAMAGE.
++ *
++ *
++ *  COMMENT: Intel 82596CA Ethernet controller, as wired on the MVME187
++ *
++ *  Board interface (at 0xfff46000): 16-bit PORT halves at 0 (low half) and
++ *  2 (high half, a write here executes the PORT command), channel attention
++ *  at 4. Memory structures are reached through the physical bus. The chip
++ *  interrupts through the PCC2 "IE" line.
++ *
++ *  Supported: the 82586, 32-bit segmented and linear modes (chosen by the
++ *  SCP sysbus byte), NOP, IA setup, configure, multicast setup, transmit
++ *  (simplified and flexible), TDR, dump and diagnose commands, and
++ *  reception into RFD/RBD lists. Set I596_DEBUG to trace.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "cpu.h"
++#include "device.h"
++#include "emul.h"
++#include "interrupt.h"
++#include "machine.h"
++#include "memory.h"
++#include "misc.h"
++#include "net.h"
++
++
++#define	I596_LEN		0x10
++#define	DEV_I596_TICK_SHIFT	14
++
++#define	MODE_82586		0
++#define	MODE_32SEG		1
++#define	MODE_LINEAR		2
++
++/*  SCB status / command bits:  */
++#define	SCB_CX			0x8000
++#define	SCB_FR			0x4000
++#define	SCB_CNA			0x2000
++#define	SCB_RNR			0x1000
++#define	SCB_CUS_SHIFT		8
++#define	SCB_RUS_SHIFT		4
++#define	CUS_IDLE		0
++#define	CUS_SUSPENDED		1
++#define	CUS_ACTIVE		2
++#define	RUS_IDLE		0
++#define	RUS_SUSPENDED		1
++#define	RUS_NORES		2
++#define	RUS_READY		4
++
++/*  Command block status / command bits:  */
++#define	CB_C			0x8000
++#define	CB_B			0x4000
++#define	CB_OK			0x2000
++#define	CB_EL			0x8000
++#define	CB_S			0x4000
++#define	CB_I			0x2000
++#define	CB_SF			0x0008
++
++struct i596_data {
++	struct interrupt	irq;
++	int			irq_asserted;
++
++	uint16_t		port_low;
++	uint32_t		scp;
++	int			mode;
++	int			byteswap;	/*  bytes swapped in 16-bit lanes  */
++	uint32_t		iscp;
++	uint32_t		base;		/*  82586/32seg offset base  */
++	uint32_t		scb;
++
++	uint16_t		stat;		/*  SCB status bits (CX..RNR)  */
++	int			cus, rus;
++	uint32_t		cbl;		/*  current command block  */
++	uint32_t		rfd;		/*  current receive frame  */
++	uint32_t		rbd;		/*  next receive buffer  */
++
++	struct nic_data		nic;
++	int			promisc;
++	int			nsai;		/*  no source address insertion  */
++	unsigned char		ia[6];
++};
++
++static int i596_debug = 0;
++#define	TRACE(...)	do { if (i596_debug) fprintf(stderr, __VA_ARGS__); } while (0)
++
++
++/*  Memory helpers: 16-bit quantities are native, 32-bit ones are stored
++    low half first (the chip is little-endian, the board swaps byte lanes).  */
++static uint16_t rd16(struct cpu *cpu, uint32_t a)
++{
++	unsigned char b[2];
++	cpu->memory_rw(cpu, cpu->mem, a, b, 2, MEM_READ, PHYSICAL);
++	return (b[0] << 8) | b[1];
++}
++static void wr16(struct cpu *cpu, uint32_t a, uint16_t v)
++{
++	unsigned char b[2] = { (unsigned char)(v >> 8), (unsigned char)v };
++	cpu->memory_rw(cpu, cpu->mem, a, b, 2, MEM_WRITE, PHYSICAL);
++}
++static uint32_t rd32(struct cpu *cpu, uint32_t a)
++{
++	return rd16(cpu, a) | ((uint32_t)rd16(cpu, a + 2) << 16);
++}
++static void wr32(struct cpu *cpu, uint32_t a, uint32_t v)
++{
++	wr16(cpu, a, v);
++	wr16(cpu, a + 2, v >> 16);
++}
++static uint8_t rd8(struct i596_data *d, struct cpu *cpu, uint32_t a)
++{
++	unsigned char b;
++	if (d->byteswap)
++		a ^= 1;
++	cpu->memory_rw(cpu, cpu->mem, a, &b, 1, MEM_READ, PHYSICAL);
++	return b;
++}
++static void wr8(struct i596_data *d, struct cpu *cpu, uint32_t a, uint8_t v)
++{
++	if (d->byteswap)
++		a ^= 1;
++	cpu->memory_rw(cpu, cpu->mem, a, &v, 1, MEM_WRITE, PHYSICAL);
++}
++
++/*  A link/pointer field: absolute in linear mode, offset from base else.  */
++static uint32_t rdptr(struct i596_data *d, struct cpu *cpu, uint32_t a)
++{
++	if (d->mode == MODE_LINEAR)
++		return rd32(cpu, a);
++	return d->base + rd16(cpu, a);
++}
++static int ptrsize(struct i596_data *d)
++{
++	return d->mode == MODE_LINEAR ? 4 : 2;
++}
++static int is_null(struct i596_data *d, struct cpu *cpu, uint32_t a)
++{
++	if (d->mode == MODE_LINEAR)
++		return rd32(cpu, a) == 0xffffffff;
++	return rd16(cpu, a) == 0xffff;
++}
++
++
++static void i596_reassert(struct i596_data *d)
++{
++	int assert = (d->stat & (SCB_CX | SCB_FR | SCB_CNA | SCB_RNR)) != 0;
++
++	if (assert && !d->irq_asserted)
++		INTERRUPT_ASSERT(d->irq);
++	if (!assert && d->irq_asserted)
++		INTERRUPT_DEASSERT(d->irq);
++	d->irq_asserted = assert;
++}
++
++
++static void i596_write_scb_status(struct i596_data *d, struct cpu *cpu)
++{
++	if (d->scb == 0)
++		return;
++	wr16(cpu, d->scb, d->stat | (d->cus << SCB_CUS_SHIFT) |
++	    (d->rus << SCB_RUS_SHIFT));
++}
++
++
++/*  Run the command list until it ends or suspends.  */
++static void i596_run_cu(struct i596_data *d, struct cpu *cpu)
++{
++	int n = 0;
++
++	while (d->cus == CUS_ACTIVE && n++ < 1000) {
++		uint32_t cb = d->cbl;
++		uint16_t cmd = rd16(cpu, cb + 2);
++		uint32_t p = cb + 4 + ptrsize(d);	/*  parameters  */
++		int ok = 1;
++
++		wr16(cpu, cb, CB_B);
++		TRACE("[ i596: CB 0x%08x cmd 0x%04x (%i) ]\n", cb, cmd, cmd & 7);
++
++		switch (cmd & 7) {
++		case 0:	/*  NOP  */
++			break;
++
++		case 1:	/*  IA setup  */
++			{
++				int i;
++				for (i = 0; i < 6; i++)
++					d->ia[i] = rd8(d, cpu, p + i);
++				memcpy(d->nic.mac_address, d->ia, 6);
++				TRACE("[ i596: IA %02x:%02x:%02x:%02x:%02x:%02x"
++				    " (raw %04x %04x %04x) ]\n", d->ia[0], d->ia[1],
++				    d->ia[2], d->ia[3], d->ia[4], d->ia[5],
++				    rd16(cpu, p), rd16(cpu, p + 2), rd16(cpu, p + 4));
++			}
++			break;
++
++		case 2:	/*  Configure  */
++			{
++				int cnt = rd8(d, cpu, p) & 0x0f, i;
++				TRACE("[ i596: configure %i bytes:", cnt);
++				for (i = 0; i < cnt; i++)
++					TRACE(" %02x", rd8(d, cpu, p + i));
++				TRACE(" ]\n");
++				if (cnt > 3)
++					d->nsai = (rd8(d, cpu, p + 3) >> 3) & 1;
++				if (cnt > 8)
++					d->promisc = rd8(d, cpu, p + 8) & 1;
++			}
++			break;
++
++		case 3:	/*  Multicast setup: accept everything  */
++			break;
++
++		case 4:	/*  Transmit  */
++			if (i596_debug) {
++				int k;
++				uint32_t t = rd32(cpu, p);
++				TRACE("[ i596: TCB");
++				for (k = 0; k < 32; k += 2)
++					TRACE(" %04x", rd16(cpu, cb + k));
++				TRACE(" ]\n[ i596: TBD@%08x", t);
++				for (k = 0; k < 16 && t != 0xffffffff; k += 2)
++					TRACE(" %04x", rd16(cpu, t + k));
++				TRACE(" ]\n");
++			}
++			{
++				unsigned char *pkt = malloc(2048);
++				int len = 0, i, tcnt;
++				uint32_t tbd, dat;
++
++				if (d->mode == MODE_82586) {
++					tbd = is_null(d, cpu, p) ? 0 :
++					    rdptr(d, cpu, p);
++					for (i = 0; i < 6; i++)
++						pkt[i] = rd8(d, cpu, p + 2 + i);
++					memcpy(pkt + 6, d->ia, 6);
++					pkt[12] = rd8(d, cpu, p + 8);
++					pkt[13] = rd8(d, cpu, p + 9);
++					len = 14;
++					tcnt = 0;
++					dat = 0;
++				} else {
++					/*  32-bit modes: TBD address, count, and
++					    the whole frame in TCB data + TBDs.  */
++					tbd = is_null(d, cpu, p) ? 0 :
++					    rd32(cpu, p);
++					tcnt = rd16(cpu, p + 4) & 0x3fff;
++					len = 0;
++					dat = p + 8;
++				}
++
++				/*  Data in the TCB (simplified mode):  */
++				for (i = 0; i < tcnt && len < 2048; i++)
++					pkt[len++] = rd8(d, cpu, dat + i);
++
++				/*  Data in TBDs (flexible mode):  */
++				while ((cmd & CB_SF) && tbd != 0 && len < 2048) {
++					uint16_t c = rd16(cpu, tbd);
++					uint32_t buf, next;
++					int bl = c & 0x3fff;
++					if (d->mode == MODE_LINEAR) {
++						next = rd32(cpu, tbd + 4);
++						buf = rd32(cpu, tbd + 8);
++					} else {
++						next = d->base + rd16(cpu, tbd + 2);
++						buf = rd32(cpu, tbd + 4);
++					}
++					for (i = 0; i < bl && len < 2048; i++)
++						pkt[len++] = rd8(d, cpu, buf + i);
++					if (c & 0x8000)
++						break;
++					tbd = next;
++				}
++
++				/*  Source address insertion, unless NSAI.  */
++				if (d->mode != MODE_82586 && !d->nsai && len >= 6
++				    && len < 2048 - 6) {
++					memmove(pkt + 12, pkt + 6, len - 6);
++					memcpy(pkt + 6, d->ia, 6);
++					len += 6;
++				}
++
++				TRACE("[ i596: transmit %i bytes to "
++				    "%02x:%02x:%02x:%02x:%02x:%02x type %02x%02x ]\n",
++				    len, pkt[0], pkt[1], pkt[2], pkt[3], pkt[4],
++				    pkt[5], pkt[12], pkt[13]);
++				if (i596_debug && len > 60) {
++					int k;
++					TRACE("[ i596: tx frame");
++					for (k = 0; k < len; k++)
++						TRACE("%s%02x", k % 32 ? "" :
++						    "\n  ", pkt[k]);
++					TRACE(" ]\n");
++				}
++				if (len < 60) {
++					memset(pkt + len, 0, 60 - len);
++					len = 60;
++				}
++				net_ethernet_tx(cpu->machine->emul->net, &d->nic,
++				    pkt, len);
++				free(pkt);
++			}
++			break;
++
++		case 5:	/*  TDR: link is fine  */
++			wr16(cpu, p, 0x8000 | 0x07ff);
++			break;
++
++		case 6:	/*  Dump  */
++		case 7:	/*  Diagnose  */
++			break;
++		}
++
++		wr16(cpu, cb, CB_C | (ok ? CB_OK : 0));
++		if (cmd & CB_I)
++			d->stat |= SCB_CX;
++
++		if (cmd & CB_EL) {
++			d->cus = CUS_IDLE;
++			d->stat |= SCB_CNA;
++		} else if (cmd & CB_S) {
++			d->cus = CUS_SUSPENDED;
++			d->stat |= SCB_CNA;
++			d->cbl = rdptr(d, cpu, cb + 4);
++		} else
++			d->cbl = rdptr(d, cpu, cb + 4);
++	}
++}
++
++
++/*  Deliver one received frame into the RFA, if there is room.  */
++static void i596_receive(struct i596_data *d, struct cpu *cpu,
++	unsigned char *pkt, int len)
++{
++	uint32_t rfd = d->rfd, rbd, p;
++	uint16_t rcmd;
++	int i, pos;
++
++	if (d->rus != RUS_READY)
++		return;
++
++	rcmd = rd16(cpu, rfd + 2);
++	wr16(cpu, rfd, CB_B);
++	p = rfd + 4 + ptrsize(d);			/*  RBD pointer  */
++
++	if (d->mode == MODE_LINEAR) {
++		/*  RFD: status, cmd, link(4), rbd(4), count(2), size(2),
++		    then (simplified mode) the whole frame. In flexible mode
++		    the frame goes to the RBD list; only the first RFD holds
++		    a valid RBD pointer, the chip keeps its own afterwards.  */
++		int size = rd16(cpu, p + 6) & 0x3fff;
++		if (i596_debug) {
++			int k;
++			TRACE("[ i596: RFD@%08x", rfd);
++			for (k = 0; k < 16; k += 2)
++				TRACE(" %04x", rd16(cpu, rfd + k));
++			TRACE(" rbd %08x ]\n", d->rbd);
++		}
++		if (!(rcmd & CB_SF) && size > 0) {
++			int size = rd16(cpu, p + 6) & 0x3fff;
++			int n = len < size ? len : size;
++			for (i = 0; i < n; i++)
++				wr8(d, cpu, p + 8 + i, pkt[i]);
++			wr16(cpu, p + 4, 0xc000 | n);
++			pos = n;
++		} else {
++			/*  Whole frame in the RBD list.  */
++			pos = 0;
++			rbd = d->rbd;
++			wr32(cpu, p, rbd);
++			wr16(cpu, p + 4, 0xc000);
++			while (pos < len && rbd != 0xffffffff && rbd != 0) {
++				uint16_t bsize = rd16(cpu, rbd + 12);
++				uint32_t buf = rd32(cpu, rbd + 8);
++				int cap = bsize & 0x3fff;
++				int n = len - pos < cap ? len - pos : cap;
++				for (i = 0; i < n; i++)
++					wr8(d, cpu, buf + i, pkt[pos + i]);
++				pos += n;
++				wr16(cpu, rbd, n | 0x4000 | (pos >= len ?
++				    0x8000 : 0));
++				if (bsize & 0x8000) {	/*  EL: list ends  */
++					rbd = 0xffffffff;
++					break;
++				}
++				rbd = rd32(cpu, rbd + 4);
++			}
++			d->rbd = rbd;
++		}
++	} else {
++		/*  82586: RFD holds dest, src, length; data goes to RBDs.  */
++		for (i = 0; i < 14; i++)
++			wr8(d, cpu, rfd + 8 + i, pkt[i]);
++		rbd = rd16(cpu, rfd + 6) == 0xffff ? 0 : d->base + rd16(cpu,
++		    rfd + 6);
++		pos = 14;
++		while (pos < len && rbd != 0) {
++			uint16_t size = rd16(cpu, rbd + 8) & 0x3fff;
++			uint32_t buf = rd32(cpu, rbd + 4);
++			int n = len - pos < size ? len - pos : size;
++			for (i = 0; i < n; i++)
++				wr8(d, cpu, buf + i, pkt[pos + i]);
++			pos += n;
++			wr16(cpu, rbd, n | 0x4000 | (pos >= len ? 0x8000 : 0));
++			rbd = rd16(cpu, rbd + 2) == 0xffff ? 0 : d->base +
++			    rd16(cpu, rbd + 2);
++		}
++	}
++
++	TRACE("[ i596: received %i bytes into RFD 0x%08x ]\n", len, rfd);
++	if (i596_debug && len > 100) {
++		int k;
++		TRACE("[ i596: frame");
++		for (k = 0; k < len; k++)
++			TRACE("%s%02x", k % 32 ? "" : "\n  ", pkt[k]);
++		TRACE(" ]\n");
++		if (d->mode == MODE_LINEAR) {
++			uint32_t r = rd32(cpu, rfd + 8);
++			while (r != 0xffffffff && r != 0) {
++				uint16_t c = rd16(cpu, r);
++				TRACE("[ i596: RBD@%08x count %04x size %04x buf %08x ]\n",
++				    r, c, rd16(cpu, r + 12), rd32(cpu, r + 8));
++				if (c & 0x8000)
++					break;
++				r = rd32(cpu, r + 4);
++			}
++		}
++	}
++	wr16(cpu, rfd, CB_C | CB_OK);
++	d->stat |= SCB_FR;
++
++	if (rcmd & CB_EL) {
++		d->rus = RUS_NORES;
++		d->stat |= SCB_RNR;
++	} else if (rcmd & CB_S) {
++		d->rus = RUS_SUSPENDED;
++		d->stat |= SCB_RNR;
++		d->rfd = rdptr(d, cpu, rfd + 4);
++	} else
++		d->rfd = rdptr(d, cpu, rfd + 4);
++}
++
++
++/*  Channel attention: first one after a reset reads SCP/ISCP.  */
++static void i596_ca(struct i596_data *d, struct cpu *cpu)
++{
++	uint16_t cmd;
++
++	if (d->scb == 0) {
++		uint16_t sysbus = rd16(cpu, d->scp + 2);
++		int bits = (sysbus >> 8) ? (sysbus >> 8) : sysbus;
++		d->mode = (bits >> 1) & 3;
++		if (d->mode == 3)
++			d->mode = MODE_LINEAR;
++		d->iscp = rd32(cpu, d->scp + 8);
++		if (d->mode == MODE_82586)
++			d->iscp &= 0xffffff;
++		if (d->mode == MODE_LINEAR) {
++			d->scb = rd32(cpu, d->iscp + 4);
++			d->base = 0;
++		} else {
++			d->base = rd32(cpu, d->iscp + 4);
++			d->scb = d->base + rd16(cpu, d->iscp + 2);
++		}
++		TRACE("[ i596: init scp 0x%08x sysbus 0x%04x mode %i iscp 0x%08x"
++		    " (%04x %04x %04x %04x) scb 0x%08x ]\n", d->scp, sysbus,
++		    d->mode, d->iscp, rd16(cpu, d->iscp), rd16(cpu, d->iscp + 2),
++		    rd16(cpu, d->iscp + 4), rd16(cpu, d->iscp + 6), d->scb);
++
++		wr16(cpu, d->iscp, 0);		/*  busy = 0  */
++		d->cus = CUS_IDLE;
++		d->rus = RUS_IDLE;
++		d->stat = SCB_CX | SCB_CNA;
++		i596_write_scb_status(d, cpu);
++		i596_reassert(d);
++		return;
++	}
++
++	cmd = rd16(cpu, d->scb + 2);
++	TRACE("[ i596: CA scb cmd 0x%04x ]\n", cmd);
++
++	/*  Acknowledge interrupt bits.  */
++	d->stat &= ~(cmd & 0xf000);
++
++	if (cmd & 0x0080) {			/*  RESET  */
++		wr16(cpu, d->scb + 2, 0);
++		d->scb = 0;
++		d->stat = 0;
++		d->cus = CUS_IDLE;
++		d->rus = RUS_IDLE;
++		i596_reassert(d);
++		return;
++	}
++
++	switch ((cmd >> 8) & 7) {
++	case 1:	/*  CU start  */
++		d->cbl = d->mode == MODE_LINEAR ? rd32(cpu, d->scb + 4) :
++		    d->base + rd16(cpu, d->scb + 4);
++		d->cus = CUS_ACTIVE;
++		break;
++	case 2:	/*  CU resume  */
++		if (d->cus == CUS_SUSPENDED)
++			d->cus = CUS_ACTIVE;
++		break;
++	case 3:	/*  CU suspend  */
++		d->cus = CUS_SUSPENDED;
++		break;
++	case 4:	/*  CU abort  */
++		d->cus = CUS_IDLE;
++		d->stat |= SCB_CNA;
++		break;
++	}
++
++	switch ((cmd >> 4) & 7) {
++	case 1:	/*  RU start  */
++		d->rfd = d->mode == MODE_LINEAR ? rd32(cpu, d->scb + 8) :
++		    d->base + rd16(cpu, d->scb + 6);
++		d->rus = RUS_READY;
++		if (d->mode == MODE_LINEAR)
++			d->rbd = rd32(cpu, d->rfd + 8);
++		TRACE("[ i596: RU start rfd 0x%08x rbd 0x%08x ]\n", d->rfd,
++		    d->rbd);
++		break;
++	case 2:	/*  RU resume  */
++		if (d->rus == RUS_SUSPENDED)
++			d->rus = RUS_READY;
++		break;
++	case 3:	/*  RU suspend  */
++		d->rus = RUS_SUSPENDED;
++		break;
++	case 4:	/*  RU abort  */
++		d->rus = RUS_IDLE;
++		d->stat |= SCB_RNR;
++		break;
++	}
++
++	wr16(cpu, d->scb + 2, 0);		/*  command accepted  */
++	i596_run_cu(d, cpu);
++	i596_write_scb_status(d, cpu);
++	i596_reassert(d);
++}
++
++
++DEVICE_TICK(i596)
++{
++	struct i596_data *d = (struct i596_data *) extra;
++	struct net *net = cpu->machine->emul->net;
++	unsigned char *pkt;
++	int len;
++
++	if (d->scb == 0 || net == NULL)
++		return;
++
++	while (d->rus == RUS_READY && net_ethernet_rx_avail(net, &d->nic)) {
++		if (!net_ethernet_rx(net, &d->nic, &pkt, &len))
++			break;
++		i596_receive(d, cpu, pkt, len);
++		free(pkt);
++		i596_write_scb_status(d, cpu);
++		i596_reassert(d);
++	}
++}
++
++
++DEVICE_ACCESS(i596)
++{
++	struct i596_data *d = (struct i596_data *) extra;
++	uint64_t idata = 0;
++
++	if (writeflag == MEM_WRITE)
++		idata = memory_readmax64(cpu, data, len);
++
++	if (writeflag == MEM_READ) {
++		memset(data, 0, len);
++		return 1;
++	}
++
++	switch (relative_addr) {
++	case 0:
++		if (len == 4) {
++			/*  Both halves at once: low half first in memory.  */
++			d->port_low = idata >> 16;
++			idata &= 0xffff;
++			goto port_high;
++		}
++		d->port_low = idata;
++		break;
++	case 2:
++	port_high:
++		{
++			uint32_t port = d->port_low | ((uint32_t)idata << 16);
++			TRACE("[ i596: PORT 0x%08x ]\n", port);
++			switch (port & 0xf) {
++			case 0:	/*  reset  */
++				d->scb = 0;
++				d->stat = 0;
++				d->cus = CUS_IDLE;
++				d->rus = RUS_IDLE;
++				i596_reassert(d);
++				break;
++			case 1:	/*  self test: signature and result  */
++				wr32(cpu, port & ~0xf, 0);
++				wr32(cpu, (port & ~0xf) + 4, 0);
++				break;
++			case 2:	/*  new SCP address  */
++				d->scp = port & ~0xf;
++				break;
++			case 3:	/*  dump  */
++				break;
++			}
++		}
++		break;
++	case 4:
++	case 6:
++		i596_ca(d, cpu);
++		break;
++	}
++
++	return 1;
++}
++
++
++DEVINIT(i596)
++{
++	struct i596_data *d;
++
++	CHECK_ALLOCATION(d = (struct i596_data *) malloc(sizeof(struct i596_data)));
++	memset(d, 0, sizeof(struct i596_data));
++
++	i596_debug = getenv("I596_DEBUG") != NULL;
++	d->byteswap = getenv("I596_BYTESWAP") != NULL;
++	d->scp = 0x00fffff4;
++
++	INTERRUPT_CONNECT(devinit->interrupt_path, d->irq);
++
++	net_generate_unique_mac(devinit->machine, d->nic.mac_address);
++	memcpy(d->ia, d->nic.mac_address, 6);
++	net_add_nic(devinit->machine->emul->net, &d->nic);
++
++	memory_device_register(devinit->machine->memory, devinit->name,
++	    devinit->addr, I596_LEN, dev_i596_access, (void *)d,
++	    DM_DEFAULT, NULL);
++
++	machine_add_tickfunction(devinit->machine, dev_i596_tick, d,
++	    DEV_I596_TICK_SHIFT);
++
++	return 1;
++}
+--- a/src/devices/Makefile.skel
++++ b/src/devices/Makefile.skel
+@@ -14,7 +14,7 @@
+ 	dev_eagle.o dev_ether.o dev_fb.o dev_fbctrl.o dev_fdc.o \
+ 	dev_footbridge.o dev_gc.o dev_gt.o dev_hammerhead.o dev_i80321.o \
+ 	dev_igsfb.o dev_iq80321_7seg.o dev_irqc.o dev_jazz.o dev_kn01.o \
+-	dev_kn02.o dev_kn02ba.o dev_kn220.o dev_kn230.o dev_lca.o dev_le.o \
++	dev_kn02.o dev_kn02ba.o dev_kn220.o dev_kn230.o dev_lca.o dev_le.o dev_i82596.o \
+ 	dev_lpt.o dev_luna88k.o dev_lunafb.o dev_m8820x.o dev_malta_lcd.o \
+ 	dev_mb8696x.o dev_mb89352.o dev_mc146818.o \
+ 	dev_mk48txx.o dev_mp.o dev_mvme187.o dev_ns16550.o dev_ohci.o \
+--- a/src/net/net.c
++++ b/src/net/net.c
+@@ -506,7 +506,7 @@
+ 		return;
+ 	}
+ 
+-	debugmsg(SUBSYS_NET, "TX", VERBOSITY_WARNING,
++	if (getenv("GXEMUL_DEVDEBUG") != NULL) debugmsg(SUBSYS_NET, "TX", VERBOSITY_WARNING,
+ 	    "ethernet packet type 0x%04x not yet implemented", eth_type);
+ }
+ 
+@@ -540,6 +540,16 @@
+ 	 *  TODO: This assumes that the first nameserver listed is the
+ 	 *        one to use.
+ 	 */
++	{
++		/*  Hosts without /etc/resolv.conf (Windows) name it here.  */
++		const char *e = getenv("GXEMUL_NAMESERVER");
++		if (e != NULL && *e != '\0' &&
++		    inet_aton(e, &net->nameserver_ipv4) != 0) {
++			net->nameserver_known = 1;
++			return;
++		}
++	}
++
+ 	f = fopen("/etc/resolv.conf", "r");
+ 	if (f == NULL)
+ 		return;
+--- a/src/net/net_ip.c
++++ b/src/net/net_ip.c
+@@ -745,6 +745,96 @@
+  *	srcport=fffc dstport=0035 length=0028 chksum=76b6
+  *	43e20100000100000000000003667470066e6574627364036f726700001c0001
+  */
++/*
++ *  net_dns_synth_ptr():
++ *
++ *  Old resolvers (e.g. SVR4's libsocket gethostbyname) insist on a reverse
++ *  lookup of every address they get, and give up when there is no PTR
++ *  record, which is common today. For answers relayed from the gateway's
++ *  nameserver: turn "no such PTR for a.b.c.d" into ip-a-b-c-d.nat.
++ *  Returns the (possibly new) length of the DNS message in buf.
++ */
++static int net_dns_synth_ptr(unsigned char *buf, int len, int bufsize)
++{
++	int pos = 12, qend, i, nlab = 0, rcode, n;
++	int octet[4];
++	char name[64];
++	unsigned char *p;
++
++	if (len < 12 || !(buf[2] & 0x80) || (buf[2] & 0x78) != 0)
++		return len;
++	rcode = buf[3] & 0x0f;
++	if ((buf[4] << 8 | buf[5]) != 1 || (buf[6] << 8 | buf[7]) != 0 ||
++	    (rcode != 0 && rcode != 3))
++		return len;
++
++	/*  Question name: d.c.b.a.in-addr.arpa  */
++	while (pos < len && buf[pos] != 0) {
++		int l = buf[pos];
++		if (l > 63 || pos + 1 + l > len)
++			return len;
++		if (nlab < 4) {
++			int v = 0;
++			if (l < 1 || l > 3)
++				return len;
++			for (i = 0; i < l; i++) {
++				if (buf[pos + 1 + i] < '0' || buf[pos + 1 + i] > '9')
++					return len;
++				v = v * 10 + buf[pos + 1 + i] - '0';
++			}
++			octet[3 - nlab] = v;
++		} else if (nlab == 4) {
++			if (l != 7 || strncasecmp((char *)buf + pos + 1,
++			    "in-addr", 7) != 0)
++				return len;
++		} else if (nlab == 5) {
++			if (l != 4 || strncasecmp((char *)buf + pos + 1,
++			    "arpa", 4) != 0)
++				return len;
++		}
++		nlab ++;
++		pos += 1 + l;
++	}
++	if (nlab != 6 || pos + 5 > len)
++		return len;
++	qend = pos + 1 + 4;
++	if ((buf[pos + 1] << 8 | buf[pos + 2]) != 12)		/*  PTR  */
++		return len;
++
++	snprintf(name, sizeof(name), "ip-%d-%d-%d-%d.nat",
++	    octet[0], octet[1], octet[2], octet[3]);
++	n = strlen(name);
++	if (qend + 12 + n + 2 > bufsize)
++		return len;
++
++	/*  Answer: c00c, PTR, IN, ttl 60, rdata = labels of name.  */
++	p = buf + qend;
++	*p++ = 0xc0; *p++ = 0x0c;
++	*p++ = 0; *p++ = 12;
++	*p++ = 0; *p++ = 1;
++	*p++ = 0; *p++ = 0; *p++ = 0; *p++ = 60;
++	*p++ = 0; *p++ = n + 2;
++	{
++		/*  "ip-a-b-c-d" label, then "nat", then root.  */
++		char *dot = strchr(name, '.');
++		int l1 = dot - name;
++		*p++ = l1;
++		memcpy(p, name, l1);
++		p += l1;
++		*p++ = 3;
++		memcpy(p, "nat", 3);
++		p += 3;
++		*p++ = 0;
++	}
++
++	buf[3] = (buf[3] & 0xf0);		/*  rcode = NOERROR  */
++	buf[6] = 0; buf[7] = 1;			/*  ancount = 1  */
++	buf[8] = 0; buf[9] = 0;			/*  nscount = 0  */
++	buf[10] = 0; buf[11] = 0;		/*  arcount = 0  */
++	return p - buf;
++}
++
++
+ static void net_ip_udp(struct net *net, struct nic_data *nic,
+ 	unsigned char *packet, int len)
+ {
+@@ -1252,7 +1342,7 @@
+ 		}
+ 		snprintf(s+strlen(s), sizeof(s)-strlen(s), " (match=%i)", match);
+ 
+-		debugmsg(SUBSYS_NET, "ip UNIMPLEMENTED BROADCAST", VERBOSITY_ERROR, "%s", s);
++		if (getenv("GXEMUL_DEVDEBUG") != NULL) debugmsg(SUBSYS_NET, "ip UNIMPLEMENTED BROADCAST", VERBOSITY_ERROR, "%s", s);
+ 	}
+ }
+ 
+@@ -1311,9 +1401,11 @@
+ 		 *  received from the nameserver (if the nameserver's IP is
+ 		 *  known), fake it so that it comes from the gateway instead.
+ 		 */
+-		if (net->udp_connections[con_id].fake_ns)
++		if (net->udp_connections[con_id].fake_ns) {
+ 			memcpy(((unsigned char *)(&from))+4,
+ 			    &net->gateway_ipv4_addr[0], 4);
++			res = net_dns_synth_ptr(buf, res, sizeof(buf));
++		}
+ 
+ 		/*
+ 		 *  We now have a UDP packet of size 'res' which we need

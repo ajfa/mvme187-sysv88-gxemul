@@ -1,0 +1,496 @@
+--- a/src/devices/dev_osiop.c
++++ b/src/devices/dev_osiop.c
+@@ -58,8 +58,9 @@
+ #include "thirdparty/osiopreg.h"
+ 
+ 
+-/*  #define debug fatal  */
+-const int osiop_debug = 0;
++#undef debug
++#define debug(...) fprintf(stderr, __VA_ARGS__)
++static int osiop_debug = 0;
+ 
+ static const char *phases[8] =
+ 	{ "DATA_OUT", "DATA_IN", "COMMAND", "STATUS",
+@@ -78,6 +79,12 @@
+ 	
+ 	int			scripts_running;
+ 
++	/*  WAIT RESELECT: parked until a target reselects or the CPU
++	    sets ISTAT.SIGP, which continues at reselect_alt.  */
++	int			waiting_reselect;
++	uint32_t		last_inval_page;	/*  page + 1, 0 = none  */
++	uint32_t		reselect_alt;
++
+ 	/*  Current transfer:  */
+ 	int			selected_id;
+ 	struct scsi_transfer	*xferp;
+@@ -205,6 +212,14 @@
+ 		    memory_paddr_to_hostaddr(cpu->mem, d->last_phys_page, 0);
+ 	}
+ 
++	if (d->last_host_page == NULL) {
++		/*  Not main RAM (e.g. the on-board SRAM): use the bus.  */
++		unsigned char b[4];
++		cpu->memory_rw(cpu, cpu->mem, addr & ~3, b, 4, MEM_READ,
++		    PHYSICAL);
++		return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
++	}
++
+ 	word = *((uint32_t *) (d->last_host_page + (addr & 0xffc)));
+ 
+ 	if (cpu->byte_order == EMUL_LITTLE_ENDIAN)
+@@ -226,10 +241,24 @@
+ 		    memory_paddr_to_hostaddr(cpu->mem, d->last_phys_page, 0);
+ 	}
+ 
++	if (d->last_host_page == NULL) {
++		uint8_t b = 0;
++		cpu->memory_rw(cpu, cpu->mem, addr, &b, 1, MEM_READ, PHYSICAL);
++		return b;
++	}
++
+ 	return d->last_host_page[addr & 0xfff];
+ }
+ static void write_byte(struct osiop_data *d, struct cpu *cpu, uint32_t addr, uint8_t byte)
+ {
++	/*  DMA into a page that may hold translated code (a program being
++	    paged in over another one): drop those translations.  */
++	if (d->last_inval_page != (addr & 0xfffff000) + 1) {
++		d->last_inval_page = (addr & 0xfffff000) + 1;
++		cpu->invalidate_code_translation(cpu, addr & 0xfffff000,
++		    INVALIDATE_PADDR);
++	}
++
+ 	if (d->last_host_page == NULL ||
+ 	    d->last_phys_page != (addr & 0xfffff000)) {
+ 		d->last_phys_page = addr & 0xfffff000;
+@@ -237,6 +266,12 @@
+ 		    memory_paddr_to_hostaddr(cpu->mem, d->last_phys_page, 1);
+ 	}
+ 
++	if (d->last_host_page == NULL) {
++		cpu->memory_rw(cpu, cpu->mem, addr, &byte, 1, MEM_WRITE,
++		    PHYSICAL);
++		return;
++	}
++
+ 	d->last_host_page[addr & 0xfff] = byte;
+ }
+ 
+@@ -351,37 +386,46 @@
+ 				break;
+ 			}
+ 
+-			if (indirect_addressing) {
+-				fatal("osiop: TODO: indirect_addressing move\n");
+-				exit(1);
+-			}
++			if (table_indirect_addressing) {
++				if (osiop_debug)
++					debug(" FROM %i", tmp);
+ 
+-			if (!table_indirect_addressing) {
+-				fatal("osiop: TODO: !table_indirect_addressing move\n");
+-				exit(1);
+-			}
+-			
+-			if (osiop_debug)
+-				debug(" FROM %i", tmp);
+-			
+-			if (ofs1 != ofs2) {
+-				fatal("osiop: TODO: move ofs1!=ofs2\n");
+-				exit(1);
++				if (ofs1 != ofs2) {
++					fatal("osiop: TODO: move ofs1!=ofs2\n");
++					exit(1);
++				}
+ 			}
+-			
++
+ 			if (phase != osiop_get_scsi_phase(d)) {
+-				fatal("osiop: TODO: move: wait for phase. "
+-				    "phase = %i, osiop_get_scsi_phase = %i\n",
+-				    phase, osiop_get_scsi_phase(d));
+-				exit(1);
++				/*  Phase mismatch: SCSI interrupt with
++				    SSTAT0.MA, SCRIPTS halt here.  */
++				if (osiop_debug)
++					debug(" PHASE MISMATCH (want %i, bus %i)",
++					    phase, osiop_get_scsi_phase(d));
++				d->reg[OSIOP_SSTAT0] |= OSIOP_SSTAT0_M_A;
++				*dspp = dspOrig;
++				d->scripts_running = 0;
++				return 0;
+ 			}
+ 
+ 			if (osiop_debug)			
+ 				debug(" WHEN %s", phases[phase]);
+ 
+-			addr = dsa + tmp;
+-			xfer_byte_count = read_word(d, cpu, addr) & 0x00ffffff;
+-			xfer_addr = read_word(d, cpu, addr+4);
++			if (table_indirect_addressing) {
++				addr = dsa + tmp;
++				xfer_byte_count = read_word(d, cpu, addr) & 0x00ffffff;
++				xfer_addr = read_word(d, cpu, addr+4);
++			} else {
++				/*  Count in the instruction, address in the
++				    second word (or pointed to by it).  */
++				xfer_byte_count = dbc;
++				xfer_addr = instr2;
++				if (indirect_addressing)
++					xfer_addr = read_word(d, cpu, instr2);
++				if (osiop_debug)
++					debug(" %i BYTES AT 0x%08x", (int) dbc,
++					    xfer_addr);
++			}
+ 
+ 			switch (phase) {
+ 
+@@ -418,6 +462,15 @@
+ 
+ 				res = diskimage_scsicommand(cpu,
+ 				    d->selected_id, DISKIMAGE_SCSI, d->xferp);
++				if (osiop_debug) {
++					size_t k;
++					debug(" [CDB");
++					for (k = 0; k < d->xferp->cmd_len; k++)
++						debug(" %02x", d->xferp->cmd[k]);
++					debug(" -> res %i in %i st %02x]", res,
++					    (int) d->xferp->data_in_len,
++					    d->xferp->status_len ? d->xferp->status[0] : 0xff);
++				}
+ 				if (res == 0) {
+ 					fatal("osiop TODO: error\n");
+ 					exit(1);
+@@ -461,9 +514,15 @@
+ 				break;
+ 
+ 			case DATA_IN_PHASE:
++				d->last_inval_page = 0;
++				if (osiop_debug)
++					debug(" [DATA_IN %i bytes -> 0x%08x]",
++					    (int) xfer_byte_count, xfer_addr);
+ 				i = 0;
+ 				while (xfer_byte_count > 0 && i + d->data_offset < d->xferp->data_in_len) {
+ 					uint8_t byte = d->xferp->data_in[i + d->data_offset];
++					if (i == 0)
++						d->reg[OSIOP_SFBR] = byte;
+ 					i ++;
+ 					/*  debug("  writing data_in byte @ 0x%08x = 0x%02x\n",
+ 					    xfer_addr, byte);  */
+@@ -481,6 +540,8 @@
+ 				i = 0;
+ 				while (xfer_byte_count > 0 && i < d->xferp->status_len) {
+ 					uint8_t byte = d->xferp->status[i++];
++					if (i == 1)
++						d->reg[OSIOP_SFBR] = byte;
+ 					/*  debug("  writing status byte @ 0x%08x = 0x%02x\n",
+ 					    xfer_addr, byte);  */
+ 					write_byte(d, cpu, xfer_addr, byte);
+@@ -495,6 +556,8 @@
+ 				i = 0;
+ 				while (xfer_byte_count > 0 && i < d->xferp->msg_in_len) {
+ 					uint8_t byte = d->xferp->msg_in[i++];
++					if (i == 1)
++						d->reg[OSIOP_SFBR] = byte;
+ 					/*  debug("  writing msg_in byte @ 0x%08x = 0x%02x\n",
+ 					    xfer_addr, byte);  */
+ 					write_byte(d, cpu, xfer_addr, byte);
+@@ -592,8 +655,8 @@
+ 				d->selected_id = -1;
+ 
+ #if 1
+-				/*  TODO: The scsi ID does not exist.
+-				    Should we simply timeout:  */
++				/*  No such target: selection timeout.  */
++				d->reg[OSIOP_SSTAT0] |= OSIOP_SSTAT0_STO;
+ 				d->scripts_running = 0;
+ #else
+ 				/*  or branch to the reselect address?  */
+@@ -609,8 +672,16 @@
+ 			break;
+ 		case 2:	if (osiop_debug)
+ 				debug(": WAIT RESELECT");
+-			fatal("osiop: TODO: wait reselect\n");
+-			exit(1);
++			target_addr = relative_addressing ?
++			    (uint32_t)(reladdr + *dspp) : instr2;
++			if (d->reg[OSIOP_ISTAT] & OSIOP_ISTAT_SIGP) {
++				*dspp = target_addr;
++			} else {
++				/*  No target ever reselects: park.  */
++				d->waiting_reselect = 1;
++				d->reselect_alt = target_addr;
++				d->scripts_running = 0;
++			}
+ 			break;
+ 	
+ 		case 3:	if (osiop_debug)
+@@ -620,6 +691,51 @@
+ 				debug(": CLEAR");
+ 			break;
+ 
++		case 5:		/*  reg = SFBR <op> data8  */
++		case 6:		/*  SFBR = reg <op> data8  */
++		case 7:		/*  reg = reg <op> data8  */
++			{
++				int a = (instr1 >> 16) & 0x3f;
++				int data8 = (instr1 >> 8) & 0xff;
++				int op = dcmd & 7, src, res;
++
++				/*  SCRIPTS use the chip's own register numbering.
++				    CTEST2 mirrors ISTAT.SIGP; reading clears it.  */
++				if (a == OSIOP_CTEST2 && opcode != 5) {
++					d->reg[a] = (d->reg[a] & ~0x40) |
++					    ((d->reg[OSIOP_ISTAT] & OSIOP_ISTAT_SIGP)
++					    ? 0x40 : 0);
++					d->reg[OSIOP_ISTAT] &= ~OSIOP_ISTAT_SIGP;
++				}
++				src = opcode == 5 ? d->reg[OSIOP_SFBR] : d->reg[a];
++				switch (op) {
++				case 0:	res = data8; break;
++				case 1:	res = src << 1; break;
++				case 2:	res = src | data8; break;
++				case 3:	res = src ^ data8; break;
++				case 4:	res = src & data8; break;
++				case 5:	res = (src >> 1) | (d->carry << 7);
++					d->carry = src & 1;
++					break;
++				case 6:	res = src + data8; break;
++				case 7:	res = src + data8 + d->carry; break;
++				default:fatal(": UNIMPLEMENTED r/w operator %i\n",
++					    op);
++					exit(1);
++				}
++				if (op != 5)
++					d->carry = res > 0xff;
++				if (opcode == 6)
++					d->reg[OSIOP_SFBR] = res;
++				else
++					d->reg[a] = res;
++				if (osiop_debug)
++					debug(": REG op%i/%i reg 0x%02x data 0x%02x"
++					    " -> 0x%02x", opcode, op, a, data8,
++					    res & 0xff);
++			}
++			break;
++
+ 		default:fatal(": UNIMPLEMENTED dcmd=0x%02x opcode=%i\n",
+ 			    dcmd, opcode);
+ 			exit(1);
+@@ -719,13 +835,13 @@
+ 				exit(1);
+ 			}
+ 			
+-			fatal("osiop: TODO: test_carry\n");
+-			exit(1);
++			comparison = d->carry;
+ 		}
+ 
+ 		if (compare_data) {
+-			fatal("osiop: TODO: compare_data\n");
+-			exit(1);
++			int mask = (dbc >> 8) & 0xff, data8 = dbc & 0xff;
++			comparison = (d->reg[OSIOP_SFBR] & ~mask & 0xff) ==
++			    (data8 & ~mask & 0xff);
+ 		}
+ 
+ 		if (compare_phase) {
+@@ -741,7 +857,8 @@
+ 
+ 			cur_phase = osiop_get_scsi_phase(d);
+ 			
+-			comparison = (phase == cur_phase);
++			comparison = (phase == cur_phase) &&
++			    (!compare_data || comparison);
+ 		}
+ 
+ 		if (!test_carry && !compare_data && !compare_phase)
+@@ -754,6 +871,9 @@
+ 				d->scripts_running = 0;
+ 				d->reg[OSIOP_DSTAT] |= OSIOP_DSTAT_SIR;
+ 			} else {
++				/*  CALL saves the return address in TEMP.  */
++				if (opcode == 1)
++					*tempp = *dspp;
+ 				*dspp = target_addr;
+ 			}
+ 		}
+@@ -763,9 +883,26 @@
+ 	case 0xc0:
+ 		if (osiop_debug)
+ 			debug(": MEMORY MOVE");
+-		/*  TODO: third instruction word!  */
+-		fatal(": TODO\n");
+-		exit(1);
++		{
++			/*  DSPS = source, third word (into TEMP) = destination,
++			    DBC = byte count. Either side may be chip registers,
++			    so go through the physical memory bus byte by byte.  */
++			uint32_t src = instr2, dst, i;
++			uint8_t b;
++
++			dst = *tempp = osiop_get_next_scripts_word(cpu, d);
++			for (i = 0; i < dbc; i++) {
++				cpu->memory_rw(cpu, cpu->mem, src + i, &b, 1,
++				    MEM_READ, PHYSICAL);
++				cpu->memory_rw(cpu, cpu->mem, dst + i, &b, 1,
++				    MEM_WRITE, PHYSICAL);
++				if (osiop_debug)
++					debug(" [%08x->%08x %02x]", src + i,
++					    dst + i, b);
++			}
++			d->last_host_page = NULL;
++			*dbcp = 0;
++		}
+ 		break;
+ 
+ 	default:fatal(": UNIMPLEMENTED dcmd 0x%02x\n", dcmd);
+@@ -822,6 +959,25 @@
+ 
+ 	idata = memory_readmax64(cpu, data, len);
+ 
++	/*  Wide access to a group of byte registers (SVR4 reads CTEST0-3
++	    as one word): split it into byte accesses, same byte lanes.  */
++	if (len > 1 && origofs != 0 && !(len == 4 &&
++	    (origofs == OSIOP_DSA || origofs == OSIOP_TEMP ||
++	    origofs == OSIOP_DBC || origofs == OSIOP_DSP ||
++	    origofs == OSIOP_DSPS || origofs == OSIOP_SCRATCH ||
++	    origofs == OSIOP_ADDER))) {
++		size_t i;
++		unsigned char b[8];
++		if (writeflag == MEM_WRITE)
++			memcpy(b, data, len);
++		for (i = 0; i < len && i < sizeof(b); i++)
++			dev_osiop_access(cpu, mem, origofs + i, b + i, 1,
++			    writeflag, extra);
++		if (writeflag == MEM_READ)
++			memcpy(data, b, len);
++		return 1;
++	}
++
+ 	/*  Make relative_addr suit addresses in osiopreg.h:  */
+ 	if (cpu->byte_order == EMUL_BIG_ENDIAN) {
+ 		relative_addr =
+@@ -829,6 +985,10 @@
+ 		    (3 - (relative_addr & 3));
+ 	}
+ 
++	if (osiop_debug && writeflag == MEM_WRITE)
++		fprintf(stderr, "[ osiop: WR 0x%02x len %i: 0x%x pc=0x%x ]\n",
++		    origofs, (int)len, (int)idata, (int)cpu->pc);
++
+ 	if (len == sizeof(uint32_t)) {
+ 		/*
+ 		 *  NOTE: These are stored in HOST byte order!
+@@ -923,9 +1083,17 @@
+ 		}
+ 		break;
+ 
++	case OSIOP_CTEST2:
++		/*  Bit 6 mirrors ISTAT.SIGP; reading clears SIGP.  */
++		if (writeflag == MEM_READ) {
++			odata = (odata & ~0x40) | ((d->reg[OSIOP_ISTAT] &
++			    OSIOP_ISTAT_SIGP) ? 0x40 : 0);
++			d->reg[OSIOP_ISTAT] &= ~OSIOP_ISTAT_SIGP;
++		}
++		break;
++
+ 	case OSIOP_CTEST0:
+ 	case OSIOP_CTEST1:
+-	case OSIOP_CTEST2:
+ 	case OSIOP_CTEST3:
+ 	case OSIOP_CTEST4:
+ 	case OSIOP_CTEST5:
+@@ -945,13 +1113,18 @@
+ 
+ 	case OSIOP_ISTAT:
+ 		if (writeflag == MEM_WRITE) {
+-			if ((idata & 0x3f) != 0x00) {
+-				fatal("osiop TODO: istat 0x%x\n", (int) idata);
+-				exit(1);
+-			}
++			if ((idata & 0x1f) != 0x00)
++				if (getenv("GXEMUL_DEVDEBUG") != NULL) fatal("[ osiop: istat write 0x%x ]\n", (int) idata);
+ 
+ 			d->reg[relative_addr] = idata &
+ 			    ~(OSIOP_ISTAT_ABRT | OSIOP_ISTAT_RST);
++
++			if ((idata & OSIOP_ISTAT_SIGP) && d->waiting_reselect) {
++				d->waiting_reselect = 0;
++				*(uint32_t*) &d->reg[OSIOP_DSP] = d->reselect_alt;
++				d->scripts_running = 1;
++				osiop_execute_scripts(cpu, d);
++			}
+ 			osiop_reassert_interrupts(d);
+ 		}
+ 		break;
+@@ -1008,14 +1181,14 @@
+ 
+ 	default:
+ 		if (writeflag == MEM_READ) {
+-			fatal("[ osiop: read from 0x%02lx ]\n",
++			if (osiop_debug) debug("[ osiop: read from 0x%02lx ]\n",
+ 			    (long)relative_addr);
+ 		} else {
+-			fatal("[ osiop: write to  0x%02lx: 0x%02x ]\n",
++			if (osiop_debug) debug("[ osiop: write to  0x%02lx: 0x%02x ]\n",
+ 			    (long)relative_addr, (int)idata);
+ 		}
+-
+-		exit(1);
++		/*  Byte value already stored/fetched above.  */
++		non1lenOk = 1;
+ 	}
+ 
+ 	if (len != 1 && !non1lenOk) {
+@@ -1024,6 +1197,10 @@
+ 		exit(1);
+ 	}
+ 
++	if (osiop_debug && writeflag == MEM_READ)
++		fprintf(stderr, "[ osiop: rd 0x%02x len %i -> 0x%x pc=0x%x ]\n",
++		    origofs, (int)len, (int)odata, (int)cpu->pc);
++
+ 	if (writeflag == MEM_READ)
+ 		memory_writemax64(cpu, data, len, odata);
+ 
+@@ -1037,6 +1214,7 @@
+ 
+ 	CHECK_ALLOCATION(d = (struct osiop_data *) malloc(sizeof(struct osiop_data)));
+ 	memset(d, 0, sizeof(struct osiop_data));
++	osiop_debug = getenv("OSIOP_DEBUG") != NULL;
+ 
+ 	/*  Set up initial device register values:  */
+ 	d->reg[OSIOP_SCID] = OSIOP_SCID_VALUE(7);
+--- a/src/disk/diskimage_scsicmd.c
++++ b/src/disk/diskimage_scsicmd.c
+@@ -300,7 +300,7 @@
+ 		if (xferp->cmd_len != 6)
+ 			debug(" (weird len=%i)", xferp->cmd_len);
+ 		if (xferp->cmd[1] != 0x00) {
+-			debugmsg(SUBSYS_DISK, "scsi", VERBOSITY_WARNING,
++			if (getenv("GXEMUL_DEVDEBUG") != NULL) debugmsg(SUBSYS_DISK, "scsi", VERBOSITY_WARNING,
+ 			    "WARNING: INQUIRY with cmd[1]=0x%02x not yet "
+ 			    "implemented", (int)xferp->cmd[1]);
+ 		}
+@@ -465,7 +465,7 @@
+ 		retlen += 100;		/*  Should be enough. (Ugly.)  */
+ 
+ 		if ((xferp->cmd[2] & 0xc0) != 0)
+-			fatal("WARNING: mode sense, cmd[2] = 0x%02x\n",
++			if (getenv("GXEMUL_DEVDEBUG") != NULL) fatal("WARNING: mode sense, cmd[2] = 0x%02x\n",
+ 			    xferp->cmd[2]);
+ 
+ 		/*  Return data:  */
+@@ -557,7 +557,7 @@
+ 			xferp->data_in[q + 29] = d->rpms & 255;
+ 			break;
+ 		default:
+-			debugmsg(SUBSYS_DISK, "scsi", VERBOSITY_WARNING,
++			if (getenv("GXEMUL_DEVDEBUG") != NULL) debugmsg(SUBSYS_DISK, "scsi", VERBOSITY_WARNING,
+ 			    "MODE_SENSE for page %i is not yet "
+ 			    "implemented!", pagecode);
+ 		}

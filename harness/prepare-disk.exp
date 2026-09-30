@@ -1,0 +1,152 @@
+#!/usr/bin/expect -f
+# prepare-disk.exp: turn the preinstalled R40V4.4 disk (made for an MVME197) into
+# one that boots on the MVME187, unattended:
+#   1. 187Bug env: auto boot from SCSI controller 0, device 0, also after a reset
+#   2. first boot: SVR4 rebuilds /stand/unix for the MVME187 and reboots
+#   3. second boot stops in single user (vfstab names m197_ devices): fix it, reboot
+#   4. multiuser: log in as root, set up the network for GXemul's gateway, shut down
+# Environment: GXEMUL (binary), ROM (187Bug 2.2), DISK (the image, changed in place),
+# GXEMUL_NVRAM (the NVRAM file, created if missing).
+set timeout 60
+log_user 1
+set gx $env(GXEMUL)
+set rom $env(ROM)
+set disk $env(DISK)
+set env(GXEMUL_EXIT_ON_HALT) 1
+
+proc boot {} {
+	global gx rom disk spawn_id
+	spawn $gx -q -Q -e mvme187 -d $disk 0xff800000:0:0:$rom 0:0:0:$rom
+}
+
+proc sh {cmd} {
+	send "$cmd\r"
+	expect {
+		-re {# $} { }
+		timeout { puts "\n*** timeout on: $cmd"; exit 1 }
+	}
+}
+
+set env_done 0
+set vfstab_done 0
+set boots 0
+set prompts 0
+boot
+while 1 {
+	set timeout 2400
+	expect {
+		"Enter Menu #:" { send "3\r" }
+		"187-Bug>" {
+			if {!$env_done} {
+				set timeout 60
+				# a blank NVRAM has no board data: without a local SCSI ID of 7
+				# 187Bug finds no SCSI device at all
+				send "cnfg;m\r"
+				expect {
+					-re {Board \(PWA\) Serial Number[^\n]*\? *$} { send "000000187001\r"; exp_continue }
+					-re {Board Identifier[^\n]*\? *$} { send "MVME187-033\r"; exp_continue }
+					-re {\nArtwork \(PWA\) Identifier[^\n]*\? *$} { send "01-W3868B01\r"; exp_continue }
+					-re {MPU Clock Speed[^\n]*\? *$} { send "3300\r"; exp_continue }
+					-re {Ethernet Address[^\n]*\? *$} { send "08003E2A187B\r"; exp_continue }
+					-re {Local SCSI Identifier[^\n]*\? *$} { send "07\r"; exp_continue }
+					-re {Optional Board[^\n]*\? *$} { send "\r"; exp_continue }
+					-re {\(Y/N\)[^\n]*$} { send "y\r"; exp_continue }
+					"187-Bug>" { }
+					timeout { puts "\n*** timeout in cnfg"; exit 1 }
+				}
+				send "env;d\r"
+				expect {
+					-re {Reset Local System[^\n]*$} { send "n\r"; exp_continue }
+					-re {\(Y/N\)[^\n]*$} { send "y\r"; exp_continue }
+					"187-Bug>" { }
+					timeout { puts "\n*** timeout in env;d"; exit 1 }
+				}
+				puts "\n*** 187Bug board data set"
+				send "env\r"
+				expect {
+					-re {Network Auto Boot[^\n]*\? $} { send "\r"; exp_continue }
+					-re {Bug or System environment[^\n]*\? *$} { send "B\r"; exp_continue }
+					-re {Auto Boot Enable \[Y/N\] *= .\? $} { send "Y\r"; exp_continue }
+					-re {Auto Boot at power-up only \[Y/N\] = .\? $} { send "N\r"; exp_continue }
+					-re {Auto Boot Controller LUN = ..\? $} { send "00\r"; exp_continue }
+					-re {Auto Boot Device LUN *= ..\? $} { send "00\r"; exp_continue }
+					-re {Auto Boot Abort Delay *= [0-9]+\? $} { send "3\r"; exp_continue }
+					-re {Update Non-Volatile RAM \(Y/N\)\? $} { send "y\r"; exp_continue }
+					-re {Reset Local System \(CPU\) \(Y/N\)\? $} { send "n\r"; exp_continue }
+					-re {\? $} { send "\r"; exp_continue }
+					"187-Bug>" { }
+					timeout { puts "\n*** timeout in env"; exit 1 }
+				}
+				set env_done 1
+				puts "\n*** 187Bug auto boot set"
+				# the new settings take effect at the next cold start
+				send "\003"
+				expect "GXemul> "
+				send "quit\r"
+				expect eof
+				wait
+				boot
+				continue
+			}
+			incr prompts
+			if {$prompts > 3} { puts "\n*** 187Bug does not boot the disk"; exit 1 }
+			# a new NVRAM knows no devices yet: I/O inquiry first
+			send "ioi\r"
+			expect "187-Bug>"
+			send "bo 0\r"
+		}
+		"system maintenance):" {
+			set timeout 120
+			send "\r"
+			expect -re {# $}
+			sh "mount -F ufs /dev/dsk/m187_c0d0s3 /usr"
+			sh "cp /etc/vfstab /etc/vfstab.m197"
+			sh "/usr/bin/sed 's/m197_/m187_/g' /etc/vfstab.m197 > /etc/vfstab"
+			sh "cd /"
+			sh "umount /usr"
+			sh "sync; sync"
+			set vfstab_done 1
+			puts "\n*** vfstab fixed"
+			send "uadmin 2 1\r"
+		}
+		-re {Console Login: $} {
+			set timeout 120
+			send "root\r"
+			expect {
+				"Password:" { send "\r"; exp_continue }
+				-re {TERM = \([^)]*\) } { send "vt100\r"; exp_continue }
+				-re {# $} { }
+			}
+			sh {cp /etc/hosts /etc/hosts.orig}
+			sh {sed -e 's/^192.168.1.197[ 	]*moto/10.0.0.1	moto/' /etc/hosts.orig > /etc/hosts}
+			sh {echo '10.0.0.254	gateway' >> /etc/hosts}
+			sh {echo 'nameserver 10.0.0.254' > /etc/resolv.conf}
+			sh {echo '#!/sbin/sh' > /etc/init.d/defroute}
+			sh {echo '# Default route to the GXemul gateway.' >> /etc/init.d/defroute}
+			sh {echo 'case "$1" in' >> /etc/init.d/defroute}
+			sh {echo "'start') /usr/sbin/route add default 10.0.0.254 1 >/dev/null 2>&1 ;;" >> /etc/init.d/defroute}
+			sh {echo "'stop') /usr/sbin/route delete default 10.0.0.254 >/dev/null 2>&1 ;;" >> /etc/init.d/defroute}
+			sh {echo 'esac' >> /etc/init.d/defroute}
+			sh {chmod 744 /etc/init.d/defroute}
+			sh {ln /etc/init.d/defroute /etc/rc2.d/S70defroute}
+			puts "\n*** network set up"
+			send "cd /; sync; shutdown -y -g0 -i0\r"
+			set timeout 300
+			expect eof
+			puts "\n*** disk ready"
+			exit 0
+		}
+		eof {
+			set st [lindex [wait] 3]
+			incr boots
+			if {$st == 3 && $boots < 5} {
+				puts "\n*** reboot"
+				boot
+			} else {
+				puts "\n*** GXemul exited with $st"
+				exit 1
+			}
+		}
+		timeout { puts "\n*** timeout"; exit 1 }
+	}
+}

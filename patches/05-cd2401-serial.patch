@@ -1,0 +1,158 @@
+--- a/src/devices/dev_clmpcc.c
++++ b/src/devices/dev_clmpcc.c
+@@ -57,6 +57,47 @@
+ #define debug fatal
+ 
+ #define	CLMPCC_LEN		0x200
++
++static int clmpcc_trace;
++
++/*
++ *  Interrupt context, as seen in STK after an interrupt acknowledge:
++ *  0x81 receive, 0x80 transmit, 0x01 modem, 0 none. Entered when the
++ *  PCC2 hands out an SCC vector, left on a write to REOIR/TEOIR/MEOIR.
++ */
++static int clmpcc_context;
++
++/*
++ *  The acknowledge also loads CAR with the interrupting channel (always 0
++ *  here) and saves the old CAR, which the EOI write puts back. SVR4/88
++ *  relies on it; 187Bug may leave CAR on another channel (no "ioi" run).
++ */
++static unsigned char *clmpcc_car;
++static unsigned char clmpcc_saved_car;
++
++void clmpcc_iack(int pcc2_vector)
++{
++	int old = clmpcc_context;
++
++	switch (pcc2_vector) {
++	case PCC2V_SCC_RX:
++	case PCC2V_SCC_RXE:	clmpcc_context = 0x81; break;
++	case PCC2V_SCC_TX:	clmpcc_context = 0x80; break;
++	case PCC2V_SCC_M:	clmpcc_context = 0x01; break;
++	default:		return;
++	}
++	if (clmpcc_car != NULL && old == 0) {
++		clmpcc_saved_car = *clmpcc_car;
++		*clmpcc_car = 0;
++	}
++}
++
++static void clmpcc_eoi(void)
++{
++	if (clmpcc_car != NULL && clmpcc_context != 0)
++		*clmpcc_car = clmpcc_saved_car;
++	clmpcc_context = 0;
++}
+ #define	DEV_CLMPCC_TICK_SHIFT	16
+ 
+ struct clmpcc_data {
+@@ -112,6 +153,10 @@
+ 	if (writeflag == MEM_READ)
+ 		odata = d->reg[relative_addr];
+ 
++	if (clmpcc_trace && writeflag == MEM_WRITE)
++		fprintf(stderr, "[ cl WR %02x=%02x car=%d ]\n",
++		    (int)relative_addr, (int)idata, d->reg[CLMPCC_REG_CAR]);
++
+ 	switch (relative_addr) {
+ 
+ 	case 0:	/*  Used by OpenBSD/mvme88k when probing...  */
+@@ -120,6 +165,19 @@
+ 	case CLMPCC_REG_TPR:	/*  Timer Period Register  */
+ 		break;
+ 
++	case CLMPCC_REG_GFRCR:	/*  Global Firmware Revision Code  */
++		odata = 0xc1;
++		break;
++
++	case CLMPCC_REG_STK:	/*  Stack Register: current interrupt context  */
++		odata = clmpcc_context;
++		break;
++
++	case CLMPCC_REG_MEOIR:	/*  Modem End of Interrupt Register  */
++		if (writeflag == MEM_WRITE)
++			clmpcc_eoi();
++		break;
++
+ 	case CLMPCC_REG_CAR:	/*  Channel Access Register  */
+ 		/*  debug("[ clmpcc: selecting channel %i ]\n",
+ 		    (int) idata);  */
+@@ -148,10 +206,14 @@
+ 
+ 	case CLMPCC_REG_STCR:	/*  Special Transmit Command Register  */
+ 		if (writeflag == MEM_WRITE) {
+-			if (idata == 0x0b) {
++			/*  0x09..0x0c: send special character SCHR1..4.  */
++			if (idata >= 0x09 && idata <= 0x0c) {
++				static const int schr[4] = { CLMPCC_REG_SCHR1,
++				    CLMPCC_REG_SCHR2, CLMPCC_REG_SCHR3,
++				    CLMPCC_REG_SCHR4 };
+ 				if (d->reg[CLMPCC_REG_CAR] == 0)
+ 					console_putchar(d->console_handle,
+-					    d->reg[CLMPCC_REG_SCHR3]);
++					    d->reg[schr[idata - 0x09]]);
+ 				else
+ 					fatal("[ clmpcc: TODO: transmit "
+ 					    "to channel, CAR!=0 ]\n");
+@@ -174,6 +236,9 @@
+ 
+ 	case CLMPCC_REG_MSVR_RTS:/* Modem Signal Value Register, RTS  */
+ 	case CLMPCC_REG_MSVR_DTR:/* Modem Signal Value Register, DTR  */
++		/*  A terminal is attached: DSR, CD and CTS are asserted.  */
++		if (writeflag == MEM_READ)
++			odata |= 0xe0;
+ 		break;
+ 
+ 	case CLMPCC_REG_RTPRl:	/*  Receive Timeout Period Register (low)  */
+@@ -224,11 +289,15 @@
+ 	case CLMPCC_REG_TEOIR:	/*  Tx End of Interrupt Register  */
+ 		/*  TODO: Do something more realistic?  */
+ 		INTERRUPT_DEASSERT(d->irq_scc_tx);
++		if (writeflag == MEM_WRITE)
++			clmpcc_eoi();
+ 		break;
+ 
+ 	case CLMPCC_REG_REOIR:	/*  Rx End of Interrupt Register  */
+ 		/*  TODO: Do something more realistic?  */
+ 		INTERRUPT_DEASSERT(d->irq_scc_rx);
++		if (writeflag == MEM_WRITE)
++			clmpcc_eoi();
+ 		break;
+ 
+ 	case CLMPCC_REG_TDR:
+@@ -243,15 +312,20 @@
+ 		}
+ 		break;
+ 
+-	default:if (writeflag == MEM_READ)
+-			fatal("[ clmpcc: unimplemented READ from offset 0x%x ]"
++	default:if (!clmpcc_trace)
++			break;
++		if (writeflag == MEM_READ)
++			debug("[ clmpcc: unimplemented READ from offset 0x%x ]"
+ 			    "\n", (int)relative_addr);
+ 		else
+-			fatal("[ clmpcc: unimplemented WRITE to offset 0x%x: "
++			debug("[ clmpcc: unimplemented WRITE to offset 0x%x: "
+ 			    "0x%x ]\n", (int)relative_addr, (int)idata);
+-		exit(1);
+ 	}
+ 
++	if (clmpcc_trace && writeflag == MEM_READ)
++		fprintf(stderr, "[ cl rd %02x -> %02x pc=%x ]\n",
++		    (int)relative_addr, (int)odata, (int)cpu->pc);
++
+ 	if (writeflag == MEM_READ)
+ 		memory_writemax64(cpu, data, len, odata);
+ 
+@@ -266,6 +340,8 @@
+ 
+ 	CHECK_ALLOCATION(d = (struct clmpcc_data *) malloc(sizeof(struct clmpcc_data)));
+ 	memset(d, 0, sizeof(struct clmpcc_data));
++	clmpcc_car = &d->reg[CLMPCC_REG_CAR];
++	clmpcc_trace = getenv("CLMPCC_DEBUG") != NULL;
+ 
+ 	d->console_handle =
+ 	    console_start_slave(devinit->machine, devinit->name2 != NULL?
